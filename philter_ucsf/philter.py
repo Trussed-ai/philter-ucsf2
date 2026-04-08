@@ -269,6 +269,82 @@ class Philter:
             raise Exception("Invalid filteype",filepath)
         return map_set
 
+    def reset(self):
+        """Clear per-document state before another ``map_coordinates`` / ``transform`` cycle."""
+        self.pos_tags = {}
+        self.cleaned = {}
+        self.data_all_files = {}
+        self.full_exclude_map = {}
+        self.coordinate_maps = []
+        self.include_map = CoordinateMap()
+        self.exclude_map = CoordinateMap()
+        self.phi_type_dict = {}
+
+        for phi_type in self.phi_type_list:
+            self.phi_type_dict[phi_type] = [CoordinateMap()]
+
+        for pattern in self.patterns:
+            pattern["coordinate_map"] = CoordinateMap()
+
+    def map_coordinates_text(self, txt: str, filename: str | None = None, reset=True):
+        if filename is None:
+            filename = '.'
+
+        if reset:
+            self.reset()
+
+        # Get full self.include/exclude map before transform
+        self.data_all_files[filename] = {"text": txt, "phi": [], "non-phi": []}
+
+        # create an intersection map of all coordinates we'll be removing
+        self.exclude_map.add_file(filename)
+
+        # create an interestion map of all coordinates we'll be keeping
+        self.include_map.add_file(filename)
+
+        # add file to phi_type_dict
+        for phi_type in self.phi_type_list:
+            self.phi_type_dict[phi_type][0].add_file(filename)
+
+        # initialize phi type
+        phi_type = "OTHER"
+
+        #### Create inital self.exclude/include for file
+
+        for i,pat in enumerate(self.patterns):
+            if pat["type"] == "regex":
+                self.map_regex(filename=filename, text=txt, pattern_index=i)
+            elif pat["type"] == "set":
+                self.map_set(filename=filename, text=txt, pattern_index=i)
+            elif pat["type"] == "regex_context":
+                self.map_regex_context(filename=filename, text=txt, pattern_index=i)
+            elif pat["type"] == "stanford_ner":
+                self.map_ner(filename=filename, text=txt, pattern_index=i)
+            elif pat["type"] == "pos_matcher":
+                self.map_pos(filename=filename, text=txt, pattern_index=i)
+            elif pat["type"] == "match_all":
+                self.match_all(filename=filename, text=txt, pattern_index=i)
+            else:
+                raise Exception("Error, pattern type not supported: ", pat["type"])
+            self.get_exclude_include_maps(filename, pat, txt)
+
+        # create intersection maps for all phi types and add them to a dictionary containing all maps
+
+        # get full exclude map (only updated either on-command by map_regex_context or at the very end of map_coordinates)
+        self.full_exclude_map[filename] = self.include_map.get_complement(filename, txt)
+
+        for phi_type in self.phi_type_list:
+            for start, stop in self.phi_type_dict[phi_type][0].filecoords(filename):
+                self.data_all_files[filename]["phi"].append(
+                    {
+                        "start": start,
+                        "stop": stop,
+                        "word": txt[start:stop],
+                        "phi_type": phi_type,
+                        "filepath": "",
+                    }
+                )
+
     def map_coordinates(self, allowed_filetypes=set(["txt", "ano"])):
         """ Runs the set, or regex on the input data 
             generating a coordinate map of hits given 
@@ -277,10 +353,8 @@ class Philter:
         in_path = self.finpath
         if not os.path.exists(in_path):
             raise Exception("Filepath does not exist", in_path)
-        
-        #create coordinate maps for each pattern
-        for i,pat in enumerate(self.patterns):
-            self.patterns[i]["coordinate_map"] = CoordinateMap()
+
+        self.reset()
 
         for root, dirs, files in os.walk(in_path):
             for f in files:
@@ -296,60 +370,10 @@ class Philter:
                 encoding = self.detect_encoding(filename)
                 if __debug__: print("reading text from " + filename)
                 txt = open(filename,"r", encoding=encoding['encoding'], errors='surrogateescape').read()
-
-                # Get full self.include/exclude map before transform
-                self.data_all_files[filename] = {"text":txt, "phi":[],"non-phi":[]}
-
-                #create an intersection map of all coordinates we'll be removing
-                self.exclude_map.add_file(filename)
-
-                #create an interestion map of all coordinates we'll be keeping
-                self.include_map.add_file(filename)
-
-                # add file to phi_type_dict
-                for phi_type in self.phi_type_list:
-                    self.phi_type_dict[phi_type][0].add_file(filename)
-
-                # initialize phi type
-                phi_type = "OTHER"
-
-                #### Create inital self.exclude/include for file
-
-                for i,pat in enumerate(self.patterns):
-                    if pat["type"] == "regex":
-                        self.map_regex(filename=filename, text=txt, pattern_index=i)
-                    elif pat["type"] == "set":
-                        self.map_set(filename=filename, text=txt, pattern_index=i)
-                    elif pat["type"] == "regex_context":
-                        self.map_regex_context(filename=filename, text=txt, pattern_index=i)
-                    elif pat["type"] == "stanford_ner":
-                        self.map_ner(filename=filename, text=txt, pattern_index=i)
-                    elif pat["type"] == "pos_matcher":
-                        self.map_pos(filename=filename, text=txt, pattern_index=i)
-                    elif pat["type"] == "match_all":
-                        self.match_all(filename=filename, text=txt, pattern_index=i)
-                    else:
-                        raise Exception("Error, pattern type not supported: ", pat["type"])
-                    self.get_exclude_include_maps(filename, pat, txt)
-
-
-                #create intersection maps for all phi types and add them to a dictionary containing all maps
-
-                # get full exclude map (only updated either on-command by map_regex_context or at the very end of map_coordinates)
-                self.full_exclude_map[filename] = self.include_map.get_complement(filename, txt)
-                
-                for phi_type in self.phi_type_list:
-                    for start,stop in self.phi_type_dict[phi_type][0].filecoords(filename):
-                        self.data_all_files[filename]["phi"].append({"start":start, "stop":stop, "word":txt[start:stop],"phi_type":phi_type, "filepath":""})
-
-
-        #clear out any data to save ram
-        for i,pat in enumerate(self .patterns):
-            if "data" in pat:
-                del self.patterns[i]["data"]
+                self.map_coordinates_text(txt, filename=filename, reset=False)
 
         return self.full_exclude_map
-                
+
     def map_regex(self, filename="", text="", pattern_index=-1, pre_process= r"[^a-zA-Z0-9]"):
         """ Creates a coordinate map from the pattern on this data
             generating a coordinate map of hits given (dry run doesn't transform)
