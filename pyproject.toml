@@ -1,0 +1,27 @@
+[build-system]
+requires = ["flit_core>=3.2.0"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "philter_ucsf"
+version = "1.0.3"
+authors = [
+  { name = "Beau Norgeot", email = "beaunorgeot@gmail.com" }
+]
+description = "An open-source PHI-filtering software"
+readme = "README.md"
+requires-python = ">=3.0"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: BSD License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "nltk",
+    "regex",
+    "chardet",
+    "numpy",
+]
+
+[project.urls]
+Homepage = "https://github.com/BCHSI/philter-ucsf"
