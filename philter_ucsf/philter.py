@@ -61,11 +61,10 @@ class Philter:
         
         if "ucsfformat" in config:
             self.ucsf_format = config["ucsfformat"]
-       
-        if "filters" in config:
-            if not os.path.exists(config["filters"]):
-                raise Exception("Filepath does not exist", config["filters"])
-            self.patterns = json.loads(open(config["filters"], "r").read())
+
+        if path := config.get("filters"):
+            path = os.path.join(self.base_path, path)
+            self.patterns = json.loads(open(path, "r").read())
 
         if "xml" in config:
             if not os.path.exists(config["xml"]):
