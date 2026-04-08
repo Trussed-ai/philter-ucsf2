@@ -21,7 +21,12 @@ class Philter:
         General text filtering class,
         can filter using whitelists, blacklists, regex's and POS
     """
-    def __init__(self, config):
+    def __init__(self, config, base_path: str | None = None):
+        if base_path is None:
+            self.base_path = os.path.dirname(__file__)
+        else:
+            self.base_path = base_path
+
         if "verbose" in config:
             self.verbose = config["verbose"]
         if "run_eval" in config:
@@ -207,7 +212,10 @@ class Philter:
         reserved_list = set(["data", "coordinate_map"])
 
         #first check that data is formatted, can be loaded etc. 
-        for i,pattern in enumerate(self.patterns):
+        for i, pattern in enumerate(self.patterns):
+            if path := pattern.get('filepath'):
+                pattern['filepath'] = os.path.join(self.base_path, path)
+
             self.pattern_indexes[pattern['title']] = i
             if pattern["type"] in require_files and not os.path.exists(pattern["filepath"]):
                 raise Exception("Config filepath does not exist", pattern["filepath"])
