@@ -59,6 +59,9 @@ def main():
     ap.add_argument("--cachepos", default=None,
                     help="Path to a directoy to store/load the pos data for all notes. If no path is specified then memory caching will be used.",
                     type=str)
+    ap.add_argument("--profile-map-coordinates", default=False,
+                    help="Print per-pattern timings for map_coordinates / map_coordinates_text (stderr-style to stdout)",
+                    type=lambda x: bool(distutils.util.strtobool(x)))
 
     args = ap.parse_args()
     run_eval = args.run_eval
@@ -76,7 +79,8 @@ def main():
             "foutpath":args.output,
             "outformat":outputformat,
             "filters":args.filters,
-            "cachepos":args.cachepos
+            "cachepos":args.cachepos,
+            "profile_map_coordinates": args.profile_map_coordinates,
         }
 
     else:
@@ -99,7 +103,8 @@ def main():
                 "classifier":args.stanfordner+"classifiers/english.all.3class.distsim.crf.ser.gz",
                 "jar":args.stanfordner+"stanford-ner.jar",
                 "download":True,
-            }
+            },
+            "profile_map_coordinates": args.profile_map_coordinates,
         }
    
     if verbose:
