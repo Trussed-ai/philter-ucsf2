@@ -2,6 +2,7 @@ import regex as re
 import warnings
 import json
 import os
+import time
 import nltk
 import itertools
 import chardet
@@ -29,6 +30,7 @@ class Philter:
 
         if "verbose" in config:
             self.verbose = config["verbose"]
+        self.profile_map_coordinates = bool(config.get("profile_map_coordinates", False))
         if "run_eval" in config:
             self.run_eval = config["run_eval"]
         if "freq_table" in config:
@@ -136,7 +138,6 @@ class Philter:
 
         #initialize our patterns
         self.init_patterns()
-
 
     def get_pos(self, filename, cleaned):
         if self.cache_to_disk:
@@ -292,6 +293,8 @@ class Philter:
         if reset:
             self.reset()
 
+        t_wall0 = time.perf_counter() if self.profile_map_coordinates else None
+
         # Get full self.include/exclude map before transform
         self.data_all_files[filename] = {"text": txt, "phi": [], "non-phi": []}
 
@@ -310,7 +313,20 @@ class Philter:
 
         #### Create inital self.exclude/include for file
 
+        if self.profile_map_coordinates:
+            profile_rows = []
+        else:
+            profile_rows = None
+
+        # POS (NLTK) runs only inside map_set when the set has a non-empty "pos" list, or in map_pos —
+        # no eager prefetch; get_pos() caches per filename for the rest of this document.
+
+        if self.profile_map_coordinates:
+            t_text0 = time.perf_counter()
+
         for i,pat in enumerate(self.patterns):
+            if profile_rows is not None:
+                t0 = time.perf_counter()
             if pat["type"] == "regex":
                 self.map_regex(filename=filename, text=txt, pattern_index=i)
             elif pat["type"] == "set":
@@ -325,11 +341,27 @@ class Philter:
                 self.match_all(filename=filename, text=txt, pattern_index=i)
             else:
                 raise Exception("Error, pattern type not supported: ", pat["type"])
+            if profile_rows is not None:
+                t1 = time.perf_counter()
             self.get_exclude_include_maps(filename, pat, txt)
+            if profile_rows is not None:
+                t2 = time.perf_counter()
+                profile_rows.append(
+                    {
+                        "idx": i,
+                        "title": pat.get("title", ""),
+                        "type": pat["type"],
+                        "map_ms": (t1 - t0) * 1000.0,
+                        "merge_ms": (t2 - t1) * 1000.0,
+                        "total_ms": (t2 - t0) * 1000.0,
+                    }
+                )
 
         # create intersection maps for all phi types and add them to a dictionary containing all maps
 
         # get full exclude map (only updated either on-command by map_regex_context or at the very end of map_coordinates)
+        if profile_rows is not None:
+            t_fin0 = time.perf_counter()
         self.full_exclude_map[filename] = self.include_map.get_complement(filename, txt)
 
         for phi_type in self.phi_type_list:
@@ -343,6 +375,28 @@ class Philter:
                         "filepath": "",
                     }
                 )
+
+        if profile_rows is not None:
+            t_fin1 = time.perf_counter()
+            finalize_ms = (t_fin1 - t_fin0) * 1000.0
+            pattern_loop_ms = (t_fin0 - t_text0) * 1000.0
+            wall_ms = (t_fin1 - t_wall0) * 1000.0
+            top = sorted(profile_rows, key=lambda r: -r["total_ms"])[:30]
+            print(
+                "[profile map_coordinates_text] "
+                f"file={filename!r} chars={len(txt)} patterns={len(self.patterns)} "
+                f"pattern_loop_ms={pattern_loop_ms:.2f} finalize_ms={finalize_ms:.2f} wall_ms={wall_ms:.2f}"
+            )
+            print("  idx    total_ms   map_ms merge_ms  type              title")
+            for r in top:
+                title = (r["title"] or "")[:48]
+                print(
+                    f"  {r['idx']:<5}  {r['total_ms']:8.2f}  {r['map_ms']:7.2f} {r['merge_ms']:7.2f}  "
+                    f"{r['type']:<16}  {title}"
+                )
+            if len(profile_rows) > 30:
+                rest = len(profile_rows) - 30
+                print(f"  ... ({rest} more patterns; showing 30 slowest)")
 
     def map_coordinates(self, allowed_filetypes=set(["txt", "ano"])):
         """ Runs the set, or regex on the input data 
@@ -368,8 +422,16 @@ class Philter:
 
                 encoding = self.detect_encoding(filename)
                 if __debug__: print("reading text from " + filename)
+                if self.profile_map_coordinates:
+                    t_read_map = time.perf_counter()
                 txt = open(filename,"r", encoding=encoding['encoding'], errors='surrogateescape').read()
                 self.map_coordinates_text(txt, filename=filename, reset=False)
+                if self.profile_map_coordinates:
+                    print(
+                        "[profile map_coordinates] "
+                        f"read+map_coordinates_text wall_ms={(time.perf_counter() - t_read_map) * 1000.0:.2f} "
+                        f"file={filename!r}"
+                    )
 
         return self.full_exclude_map
 
@@ -565,11 +627,9 @@ class Philter:
 
         cleaned = self.get_clean(filename,text)
         if check_pos:
-            pos_list = self.get_pos(filename, cleaned)# pos_list = nltk.pos_tag(cleaned)
+            pos_list = self.get_pos(filename, cleaned)
         else:
-            pos_list = zip(cleaned,range(len(cleaned)))
-
-        pos_list = nltk.pos_tag(cleaned)
+            pos_list = zip(cleaned, itertools.repeat(None))
 
         # if filename == './data/i2b2_notes/160-03.txt':
         #     print(pos_list)

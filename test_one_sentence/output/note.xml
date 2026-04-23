@@ -1,0 +1,9 @@
+<?xml version="1.0" ?>
+<Philter>
+<TEXT><![CDATA[Dr. Smith saw the patient on 04/08/2026 and planned follow-up at UCSF Medical Center.
+]]></TEXT>
+<TAGS>
+<DATE id="P0" start="29" end="39" text="04/08/2026" TYPE="DATE" comment="" />
+<OTHER id="P1" start="4" end="9" text="Smith" TYPE="OTHER" comment="" />
+</TAGS>
+</Philter>
