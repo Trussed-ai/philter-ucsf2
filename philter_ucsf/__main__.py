@@ -44,16 +44,16 @@ def main():
                     type=str)
     ap.add_argument("-v", "--verbose", default=True,
                     help="When verbose is true, will emit messages about script progress",
-                    type=lambda x: _strtobool(x))
+                    type=_strtobool)
     ap.add_argument("-e", "--run_eval", default=True,
                     help="When run_eval is true, will run our eval script and emit summarized results to terminal",
-                    type=lambda x: _strtobool(x))
+                    type=_strtobool)
     ap.add_argument("-t", "--freq_table", default=False,
                     help="When freqtable is true, will output a unigram/bigram frequency table of all note words and their PHI/non-PHI counts",
-                    type=lambda x: _strtobool(x)) 
+                    type=_strtobool) 
     ap.add_argument("-n", "--initials", default=True,
                     help="When initials is true, will include initials PHI in recall/precision calculations",
-                    type=lambda x: _strtobool(x)) 
+                    type=_strtobool) 
     ap.add_argument("--stanfordner", default="/usr/local/stanford-ner/",
                     help="Path to Stanford NER, the default is /usr/local/stanford-ner/",
                     type=str)
@@ -62,16 +62,16 @@ def main():
                     type=str)
     ap.add_argument("--ucsfformat", default=False,
                     help="When ucsfformat is true, will adjust eval script for slightly different xml format",
-                    type=lambda x: _strtobool(x))
+                    type=_strtobool)
     ap.add_argument("--prod", default=False,
                     help="When prod is true, this will run the script with output in i2b2 xml format without running the eval script",
-                    type=lambda x: _strtobool(x))
+                    type=_strtobool)
     ap.add_argument("--cachepos", default=None,
                     help="Path to a directoy to store/load the pos data for all notes. If no path is specified then memory caching will be used.",
                     type=str)
     ap.add_argument("--profile-map-coordinates", default=False,
                     help="Print per-pattern timings for map_coordinates / map_coordinates_text (stderr-style to stdout)",
-                    type=lambda x: _strtobool(x))
+                    type=_strtobool)
     ap.add_argument(
         "--phi-types",
         default=None,

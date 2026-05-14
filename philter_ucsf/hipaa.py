@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from typing import NamedTuple
 
 # id 1..18 — short keys stable for APIs
 HIPAA_18 = (
@@ -353,14 +354,20 @@ def _slug_title(title: str) -> str:
     return s if s else "untitled"
 
 
+class HipaaMinimalCoverResult(NamedTuple):
+    tokens_for_active_patterns: frozenset[str]
+    ordered_chosen_titles: list[str]
+    still_uncovered_hipaa_ids: set[int]
+
+
 def hipaa_minimal_cover_active_pattern_tokens(
     patterns: list[dict],
-) -> tuple[frozenset[str], list[str], set[int]]:
+) -> HipaaMinimalCoverResult:
     """
     Greedy approximate set cover: pick exclude rules (in config order as tie-break)
     so each HIPAA id 1–18 that appears on at least one rule is hit at least once.
 
-    Returns (tokens_for_active_patterns, ordered_chosen_titles, still_uncovered_hipaa_ids).
+    Returns HipaaMinimalCoverResult (unpackable in field order).
     """
     excludes = [p for p in patterns if p.get("exclude", True)]
     uncovered: set[int] = set(range(1, 19))
@@ -371,7 +378,7 @@ def hipaa_minimal_cover_active_pattern_tokens(
         best_i = None
         best_new_count = -1
         for i, p in enumerate(excludes):
-            title = (p.get("title") or "").strip()
+            title = (p.get("title"), "").strip()
             if not title or title in picked_set:
                 continue
             ids = pattern_hipaa_ids_for_pattern(p)
@@ -387,7 +394,7 @@ def hipaa_minimal_cover_active_pattern_tokens(
         if best_i is None or best_new_count <= 0:
             break
         p = excludes[best_i]
-        title = (p.get("title") or "").strip()
+        title = (p.get("title"), "").strip()
         picked_set.add(title)
         picked_titles.append(title)
         uncovered -= pattern_hipaa_ids_for_pattern(p)
@@ -396,4 +403,6 @@ def hipaa_minimal_cover_active_pattern_tokens(
     for t in picked_titles:
         expanded.add(t)
         expanded.add(_slug_title(t))
-    return frozenset(expanded), picked_titles, uncovered
+    return HipaaMinimalCoverResult(
+        frozenset(expanded), picked_titles, uncovered
+    )
