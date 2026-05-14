@@ -3,6 +3,7 @@ import warnings
 import json
 import os
 import time
+from xml.sax.saxutils import escape as _xml_escape
 import nltk
 import itertools
 import chardet
@@ -10,6 +11,12 @@ import pickle
 from chardet.universaldetector import UniversalDetector
 from nltk.stem.wordnet import WordNetLemmatizer
 from philter_ucsf.coordinate_map import CoordinateMap
+from philter_ucsf.hipaa import (
+    HIPAA_18,
+    infer_hipaa_ids,
+    parse_active_hipaa_identifiers,
+    pattern_hipaa_ids_for_pattern,
+)
 from nltk.tag.stanford import StanfordNERTagger
 import subprocess
 import numpy
@@ -122,6 +129,56 @@ class Philter:
         for phi_type in self.phi_type_list:
             self.phi_type_dict[phi_type] = [CoordinateMap()]
 
+        raw_active = config.get("active_phi_types")
+        if raw_active is None:
+            self.active_phi_types = None
+        else:
+            if isinstance(raw_active, str):
+                raw_active = [x.strip() for x in raw_active.split(",") if x.strip()]
+            elif not isinstance(raw_active, (list, tuple, set)):
+                raise TypeError("active_phi_types must be str, list, tuple, set, or omitted")
+            else:
+                raw_active = [str(x).strip() for x in raw_active if str(x).strip()]
+            if not raw_active:
+                self.active_phi_types = None
+            else:
+                known = set(self.phi_type_list)
+                self.active_phi_types = frozenset(x for x in raw_active if x in known)
+                unknown = [x for x in raw_active if x not in known]
+                if unknown and self.verbose:
+                    print(
+                        "Warning: unknown phi types ignored (not in phi_type_list):",
+                        unknown,
+                    )
+                if not self.active_phi_types:
+                    raise ValueError(
+                        "active_phi_types: no valid types after filtering known list"
+                    )
+
+        raw_pat = config.get("active_patterns")
+        if raw_pat is None:
+            self.active_patterns = None
+        else:
+            if isinstance(raw_pat, str):
+                raw_pat = [x.strip() for x in raw_pat.split(",") if x.strip()]
+            elif not isinstance(raw_pat, (list, tuple, set)):
+                raise TypeError("active_patterns must be str, list, tuple, set, or omitted")
+            else:
+                raw_pat = [str(x).strip() for x in raw_pat if str(x).strip()]
+            if not raw_pat:
+                self.active_patterns = None
+            else:
+                expanded = set()
+                for x in raw_pat:
+                    expanded.add(x)
+                    expanded.add(self._slug_pattern_title(x))
+                self.active_patterns = frozenset(expanded)
+
+        raw_hipaa = config.get("active_hipaa_identifiers") or config.get(
+            "active_hipaa"
+        )
+        self.active_hipaa_identifiers = parse_active_hipaa_identifiers(raw_hipaa)
+
         #create a memory for stored coordinate data
         self.data_all_files = {}
 
@@ -138,6 +195,47 @@ class Philter:
 
         #initialize our patterns
         self.init_patterns()
+        self.phi_hit_log = {}
+
+        self._hipaa_minimal_floor_tokens = None
+        self._hipaa_minimal_floor_titles = None
+        self._hipaa_minimal_uncovered_ids = None
+        self._hipaa_preset = None
+        if config.get("hipaa_preset"):
+            self._hipaa_preset = str(config["hipaa_preset"]).strip().lower()
+            self._apply_hipaa_preset()
+
+    def _apply_hipaa_preset(self):
+        """Apply hipaa_preset=minimal|minimal_plus after patterns are loaded."""
+        from philter_ucsf.hipaa import hipaa_minimal_cover_active_pattern_tokens
+
+        preset = self._hipaa_preset
+        if preset not in ("minimal", "minimal_plus"):
+            raise ValueError(
+                "hipaa_preset must be 'minimal' or 'minimal_plus', got %r" % (preset,)
+            )
+        tokens, titles, uncovered = hipaa_minimal_cover_active_pattern_tokens(
+            self.patterns
+        )
+        self._hipaa_minimal_floor_tokens = tokens
+        self._hipaa_minimal_floor_titles = titles
+        self._hipaa_minimal_uncovered_ids = sorted(uncovered)
+        self.active_hipaa_identifiers = None
+        n_all = sum(1 for p in self.patterns if p.get("exclude", True))
+        if preset == "minimal":
+            self.active_patterns = tokens
+            print(
+                f"[hipaa_preset=minimal] {len(titles)} exclude rules active "
+                f"(greedy HIPAA 1–18 floor of {n_all}). "
+                f"Uncovered HIPAA ids (no rule in this config for heuristic): {sorted(uncovered)}"
+            )
+        else:
+            self.active_patterns = None
+            print(
+                f"[hipaa_preset=minimal_plus] All {n_all} exclude rules active; "
+                f"greedy HIPAA-only floor would be {len(titles)} rules. "
+                f"Uncovered HIPAA ids at heuristic/title level: {sorted(uncovered)}"
+            )
 
     def get_pos(self, filename, cleaned):
         if self.cache_to_disk:
@@ -285,6 +383,66 @@ class Philter:
 
         for pattern in self.patterns:
             pattern["coordinate_map"] = CoordinateMap()
+        self.phi_hit_log = {}
+
+    def _record_phi_pattern_hit(
+        self, filename: str, phi_type: str, start: int, stop: int, pattern_title: str
+    ):
+        """Log exclude hits so each PHI span can be attributed to config pattern titles."""
+        self.phi_hit_log.setdefault(filename, []).append(
+            {
+                "phi_type": phi_type,
+                "start": start,
+                "stop": stop,
+                "pattern_title": pattern_title,
+            }
+        )
+
+    @staticmethod
+    def _ranges_overlap(s1: int, e1: int, s2: int, e2: int) -> bool:
+        """Half-open intervals [start, stop)."""
+        return s1 < e2 and s2 < e1
+
+    @staticmethod
+    def _slug_pattern_title(title: str) -> str:
+        s = re.sub(r"[^a-zA-Z0-9]+", "_", (title or "untitled").strip())
+        s = s.strip("_")
+        return s if s else "untitled"
+
+    @staticmethod
+    def _xml_attr_value(s: str) -> str:
+        return _xml_escape(
+            str(s), entities={'"': "&quot;", "\n": "&#10;", "\r": "&#13;"}
+        )
+
+    def _pattern_matches_hipaa(self, pattern: dict) -> bool:
+        """If active_hipaa_identifiers is set, only exclude rules grouped under those HIPAA ids apply."""
+        if self.active_hipaa_identifiers is None:
+            return True
+        ids = pattern_hipaa_ids_for_pattern(pattern)
+        return bool(self.active_hipaa_identifiers & ids)
+
+    def _pattern_matches_active(self, pattern: dict) -> bool:
+        """If active_patterns is set, only these pattern titles/slugs apply exclude effects."""
+        if self.active_patterns is None:
+            return True
+        title = pattern.get("title", "") or ""
+        slug = self._slug_pattern_title(title)
+        return title in self.active_patterns or slug in self.active_patterns
+
+    def _exclude_effect_enabled(
+        self, phi_type: str, exclude: bool, pattern: dict
+    ) -> bool:
+        """Whitelist patterns always apply; exclude patterns may be limited by HIPAA id, pattern titles, and phi types."""
+        if not exclude:
+            return True
+        if not self._pattern_matches_hipaa(pattern):
+            return False
+        if not self._pattern_matches_active(pattern):
+            return False
+        if self.active_phi_types is None:
+            return True
+        return phi_type in self.active_phi_types
 
     def map_coordinates_text(self, txt: str, filename: str | None = None, reset=True):
         if filename is None:
@@ -297,6 +455,24 @@ class Philter:
 
         # Get full self.include/exclude map before transform
         self.data_all_files[filename] = {"text": txt, "phi": [], "non-phi": []}
+
+        if self.verbose and self.active_phi_types is not None:
+            print(
+                "active_phi_types (exclude rules only):",
+                ", ".join(sorted(self.active_phi_types)),
+            )
+        if self.verbose and self.active_patterns is not None:
+            print(
+                "active_patterns (exclude rules only):",
+                len(self.active_patterns),
+                "title/slug tokens",
+            )
+        if self.verbose and self.active_hipaa_identifiers is not None:
+            parts = [
+                f"{i}:{HIPAA_18[i - 1]['key']}"
+                for i in sorted(self.active_hipaa_identifiers)
+            ]
+            print("active_hipaa_identifiers (exclude rules only):", ", ".join(parts))
 
         # create an intersection map of all coordinates we'll be removing
         self.exclude_map.add_file(filename)
@@ -364,17 +540,39 @@ class Philter:
             t_fin0 = time.perf_counter()
         self.full_exclude_map[filename] = self.include_map.get_complement(filename, txt)
 
+        hits = self.phi_hit_log.get(filename, [])
         for phi_type in self.phi_type_list:
             for start, stop in self.phi_type_dict[phi_type][0].filecoords(filename):
-                self.data_all_files[filename]["phi"].append(
-                    {
-                        "start": start,
-                        "stop": stop,
-                        "word": txt[start:stop],
-                        "phi_type": phi_type,
-                        "filepath": "",
-                    }
-                )
+                patterns = []
+                for hit in hits:
+                    if hit["phi_type"] != phi_type:
+                        continue
+                    if not self._ranges_overlap(
+                        start, stop, hit["start"], hit["stop"]
+                    ):
+                        continue
+                    t = hit["pattern_title"]
+                    if t not in patterns:
+                        patterns.append(t)
+                entry = {
+                    "start": start,
+                    "stop": stop,
+                    "word": txt[start:stop],
+                    "phi_type": phi_type,
+                    "filepath": "",
+                }
+                if patterns:
+                    entry["pattern"] = " | ".join(patterns)
+                    entry["phi_bucket"] = phi_type + "__" + "__".join(
+                        self._slug_pattern_title(t) for t in patterns
+                    )
+                else:
+                    entry["phi_bucket"] = phi_type + "__unattributed"
+                blob = (entry.get("pattern") or "").lower()
+                hids = infer_hipaa_ids(phi_type, blob)
+                entry["hipaa_identifier_ids"] = hids
+                entry["hipaa_keys"] = [HIPAA_18[i - 1]["key"] for i in hids]
+                self.data_all_files[filename]["phi"].append(entry)
 
         if profile_rows is not None:
             t_fin1 = time.perf_counter()
@@ -806,13 +1004,27 @@ class Philter:
         else:
             phi_type = "OTHER"
 
+        if phi_type not in self.phi_type_dict:
+            phi_type = "OTHER"
+
+        apply_exclude_phi = self._exclude_effect_enabled(phi_type, exclude, pattern)
+
         for start,stop in coord_map.filecoords(filename):
 
             if pattern['type'] != 'regex_context':
                 if exclude:
+                    if not apply_exclude_phi:
+                        continue
                     if not self.include_map.does_overlap(filename, start, stop):
                         self.exclude_map.add_extend(filename, start, stop)
                         self.phi_type_dict[phi_type][0].add_extend(filename, start, stop)
+                        self._record_phi_pattern_hit(
+                            filename,
+                            phi_type,
+                            start,
+                            stop,
+                            pattern.get("title", "untitled"),
+                        )
 
                 else:
                     if not self.exclude_map.does_overlap(filename, start, stop):
@@ -826,9 +1038,18 @@ class Philter:
             # Add regex_context to map separately
             else:
                 if exclude:
+                    if not apply_exclude_phi:
+                        continue
                     self.exclude_map.add_extend(filename, start, stop)
                     self.include_map.remove(filename, start, stop)
                     self.phi_type_dict[phi_type][0].add_extend(filename, start, stop)
+                    self._record_phi_pattern_hit(
+                        filename,
+                        phi_type,
+                        start,
+                        stop,
+                        pattern.get("title", "untitled"),
+                    )
                 else:
                     self.include_map.add_extend(filename, start, stop)
                     self.exclude_map.remove(filename, start, stop)
@@ -950,6 +1171,23 @@ class Philter:
             contents.append(tagdata['phi'][i]['word'])
             contents.append("\" TYPE=\"")
             contents.append(phi_type)
+            rec = tagdata["phi"][i]
+            if rec.get("pattern"):
+                contents.append("\" pattern=\"")
+                contents.append(self._xml_attr_value(rec["pattern"]))
+            if rec.get("phi_bucket"):
+                contents.append("\" phi_bucket=\"")
+                contents.append(self._xml_attr_value(rec["phi_bucket"]))
+            if rec.get("hipaa_identifier_ids"):
+                contents.append("\" hipaa_ids=\"")
+                contents.append(
+                    self._xml_attr_value(
+                        ",".join(str(x) for x in rec["hipaa_identifier_ids"])
+                    )
+                )
+            if rec.get("hipaa_keys"):
+                contents.append("\" hipaa_keys=\"")
+                contents.append(self._xml_attr_value(",".join(rec["hipaa_keys"])))
             contents.append("\" comment=\"\" />\n")
         
 
@@ -2511,5 +2749,3 @@ class Philter:
 
         items.sort(key=lambda x: x["count"], reverse=True)
         json.dump(items, open(sorted_path, "w"), indent=4)
-
-
