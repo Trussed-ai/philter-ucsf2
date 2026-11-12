@@ -158,7 +158,7 @@ def infer_hipaa_ids(phi_type: str, pattern_blob: str) -> list[int]:
     ):
         ids.add(1)
 
-    if pt == "Provider_Address_or_Location" or any(
+    if pt == "PROVIDER_ADDRESS_OR_LOCATION" or any(
         x in pb
         for x in (
             "street",
@@ -200,7 +200,7 @@ def infer_hipaa_ids(phi_type: str, pattern_blob: str) -> list[int]:
     if pt == "EMAIL" or "email" in pb:
         ids.add(6)
 
-    if pt == "Patient_Social_Security_Number" or "ssn" in pb or "social security" in pb:
+    if pt == "PATIENT_SOCIAL_SECURITY_NUMBER" or "ssn" in pb or "social security" in pb:
         ids.add(7)
 
     if "mrn" in pb or "medical record" in pb:

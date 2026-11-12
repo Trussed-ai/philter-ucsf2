@@ -24,6 +24,19 @@ import random
 import string
 
 
+# Decides the label when overlapping PHI spans of different types have equal length:
+# specific types win over OTHER.
+PHI_TYPE_PRECEDENCE = (
+    "Patient_Social_Security_Number",
+    "Email",
+    "DATE",
+    "Age",
+    "Provider_Address_or_Location",
+    "Name",
+    "OTHER",
+)
+
+
 class Philter:
     """ 
         General text filtering class,
@@ -398,6 +411,47 @@ class Philter:
             }
         )
 
+    def _resolve_phi_spans(self, filename: str, hits: list[dict]):
+        """Yield non-overlapping (start, stop, phi_type, pattern_titles) PHI spans, ordered by start.
+
+        Each phi type has its own coordinate map, so the same text can be hit by rules of several
+        types (e.g. an SSN by both "ssn only" and "DD-DD-DD-DD"). Overlapping spans are merged into
+        their union and labeled with the type of the longest span; equal lengths are decided by
+        PHI_TYPE_PRECEDENCE. Pattern titles of all merged spans are kept, the winner's first.
+        """
+        rank = {t: i for i, t in enumerate(PHI_TYPE_PRECEDENCE)}
+        spans = []
+        for phi_type in self.phi_type_list:
+            for start, stop in self.phi_type_dict[phi_type][0].filecoords(filename):
+                patterns = []
+                for hit in hits:
+                    if hit["phi_type"] != phi_type:
+                        continue
+                    if not self._ranges_overlap(start, stop, hit["start"], hit["stop"]):
+                        continue
+                    t = hit["pattern_title"]
+                    if t not in patterns:
+                        patterns.append(t)
+                spans.append((start, stop, phi_type, patterns))
+
+        spans.sort(key=lambda s: (s[0], s[1]))
+        clusters = []  # [start, stop, member spans]
+        for span in spans:
+            if clusters and span[0] < clusters[-1][1]:
+                clusters[-1][1] = max(clusters[-1][1], span[1])
+                clusters[-1][2].append(span)
+            else:
+                clusters.append([span[0], span[1], [span]])
+
+        for start, stop, members in clusters:
+            members.sort(key=lambda s: (s[0] - s[1], rank.get(s[2], len(rank))))
+            patterns = []
+            for member in members:
+                for t in member[3]:
+                    if t not in patterns:
+                        patterns.append(t)
+            yield start, stop, members[0][2], patterns
+
     @staticmethod
     def _ranges_overlap(s1: int, e1: int, s2: int, e2: int) -> bool:
         """Half-open intervals [start, stop)."""
@@ -541,38 +595,26 @@ class Philter:
         self.full_exclude_map[filename] = self.include_map.get_complement(filename, txt)
 
         hits = self.phi_hit_log.get(filename, [])
-        for phi_type in self.phi_type_list:
-            for start, stop in self.phi_type_dict[phi_type][0].filecoords(filename):
-                patterns = []
-                for hit in hits:
-                    if hit["phi_type"] != phi_type:
-                        continue
-                    if not self._ranges_overlap(
-                        start, stop, hit["start"], hit["stop"]
-                    ):
-                        continue
-                    t = hit["pattern_title"]
-                    if t not in patterns:
-                        patterns.append(t)
-                entry = {
-                    "start": start,
-                    "stop": stop,
-                    "word": txt[start:stop],
-                    "phi_type": phi_type,
-                    "filepath": "",
-                }
-                if patterns:
-                    entry["pattern"] = " | ".join(patterns)
-                    entry["phi_bucket"] = phi_type + "__" + "__".join(
-                        self._slug_pattern_title(t) for t in patterns
-                    )
-                else:
-                    entry["phi_bucket"] = phi_type + "__unattributed"
-                blob = (entry.get("pattern") or "").lower()
-                hids = infer_hipaa_ids(phi_type, blob)
-                entry["hipaa_identifier_ids"] = hids
-                entry["hipaa_keys"] = [HIPAA_18[i - 1]["key"] for i in hids]
-                self.data_all_files[filename]["phi"].append(entry)
+        for start, stop, phi_type, patterns in self._resolve_phi_spans(filename, hits):
+            entry = {
+                "start": start,
+                "stop": stop,
+                "word": txt[start:stop],
+                "phi_type": phi_type,
+                "filepath": "",
+            }
+            if patterns:
+                entry["pattern"] = " | ".join(patterns)
+                entry["phi_bucket"] = phi_type + "__" + "__".join(
+                    self._slug_pattern_title(t) for t in patterns
+                )
+            else:
+                entry["phi_bucket"] = phi_type + "__unattributed"
+            blob = (entry.get("pattern") or "").lower()
+            hids = infer_hipaa_ids(phi_type, blob)
+            entry["hipaa_identifier_ids"] = hids
+            entry["hipaa_keys"] = [HIPAA_18[i - 1]["key"] for i in hids]
+            self.data_all_files[filename]["phi"].append(entry)
 
         if profile_rows is not None:
             t_fin1 = time.perf_counter()
