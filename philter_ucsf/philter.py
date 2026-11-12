@@ -3,6 +3,7 @@ import warnings
 import json
 import os
 import time
+from dataclasses import dataclass, field
 from xml.sax.saxutils import escape as _xml_escape
 import nltk
 import itertools
@@ -35,6 +36,33 @@ PHI_TYPE_PRECEDENCE = (
     "Name",
     "OTHER",
 )
+
+
+@dataclass(frozen=True)
+class PhiScope:
+    """Which exclude (PHI) rules apply in a map_coordinates_text() call.
+
+    Build it with Philter.make_scope() and pass it as ``scope=``; it is only valid for the
+    instance that built it. Whitelist (include) rules always apply.
+    """
+
+    phi_types: frozenset[str] | None
+    """Only rules with these phi types, or None for all."""
+
+    patterns: frozenset[str] | None
+    """Only rules with these titles (or title slugs), or None for all."""
+
+    hipaa_identifiers: frozenset[int] | None
+    """Only rules grouped under these HIPAA identifier ids (1-18), or None for all."""
+
+    disabled: frozenset[int]
+    """Indexes of exclude rules whose matches are ignored."""
+
+    skipped: frozenset[int]
+    """Disabled rules that no enabled rule reads; they are not run at all."""
+
+    owner: int = field(repr=False, compare=False)
+    """id() of the Philter instance that built the scope."""
 
 
 class Philter:
@@ -142,55 +170,16 @@ class Philter:
         for phi_type in self.phi_type_list:
             self.phi_type_dict[phi_type] = [CoordinateMap()]
 
-        raw_active = config.get("active_phi_types")
-        if raw_active is None:
-            self.active_phi_types = None
-        else:
-            if isinstance(raw_active, str):
-                raw_active = [x.strip() for x in raw_active.split(",") if x.strip()]
-            elif not isinstance(raw_active, (list, tuple, set)):
-                raise TypeError("active_phi_types must be str, list, tuple, set, or omitted")
-            else:
-                raw_active = [str(x).strip() for x in raw_active if str(x).strip()]
-            if not raw_active:
-                self.active_phi_types = None
-            else:
-                known = set(self.phi_type_list)
-                self.active_phi_types = frozenset(x for x in raw_active if x in known)
-                unknown = [x for x in raw_active if x not in known]
-                if unknown and self.verbose:
-                    print(
-                        "Warning: unknown phi types ignored (not in phi_type_list):",
-                        unknown,
-                    )
-                if not self.active_phi_types:
-                    raise ValueError(
-                        "active_phi_types: no valid types after filtering known list"
-                    )
-
-        raw_pat = config.get("active_patterns")
-        if raw_pat is None:
-            self.active_patterns = None
-        else:
-            if isinstance(raw_pat, str):
-                raw_pat = [x.strip() for x in raw_pat.split(",") if x.strip()]
-            elif not isinstance(raw_pat, (list, tuple, set)):
-                raise TypeError("active_patterns must be str, list, tuple, set, or omitted")
-            else:
-                raw_pat = [str(x).strip() for x in raw_pat if str(x).strip()]
-            if not raw_pat:
-                self.active_patterns = None
-            else:
-                expanded = set()
-                for x in raw_pat:
-                    expanded.add(x)
-                    expanded.add(self._slug_pattern_title(x))
-                self.active_patterns = frozenset(expanded)
-
+        # Rule selection from the config. map_coordinates_text() uses it unless a scope from make_scope()
+        # is passed, so one instance can serve several selections.
+        self.active_phi_types = self._parse_active_phi_types(config.get("active_phi_types"))
+        self.active_patterns = self._parse_active_patterns(config.get("active_patterns"))
         raw_hipaa = config.get("active_hipaa_identifiers") or config.get(
             "active_hipaa"
         )
         self.active_hipaa_identifiers = parse_active_hipaa_identifiers(raw_hipaa)
+        self._default_scope = None
+        self._default_scope_key = None
 
         #create a memory for stored coordinate data
         self.data_all_files = {}
@@ -469,38 +458,136 @@ class Philter:
             str(s), entities={'"': "&quot;", "\n": "&#10;", "\r": "&#13;"}
         )
 
-    def _pattern_matches_hipaa(self, pattern: dict) -> bool:
-        """If active_hipaa_identifiers is set, only exclude rules grouped under those HIPAA ids apply."""
-        if self.active_hipaa_identifiers is None:
-            return True
-        ids = pattern_hipaa_ids_for_pattern(pattern)
-        return bool(self.active_hipaa_identifiers & ids)
+    @staticmethod
+    def _parse_str_list(raw, name: str) -> list[str] | None:
+        """Comma-separated string or collection -> non-empty list of stripped strings, or None."""
+        if raw is None:
+            return None
+        if isinstance(raw, str):
+            items = [x.strip() for x in raw.split(",") if x.strip()]
+        elif isinstance(raw, (list, tuple, set, frozenset)):
+            items = [str(x).strip() for x in raw if str(x).strip()]
+        else:
+            raise TypeError(f"{name} must be str, list, tuple, set, or omitted")
+        return items or None
 
-    def _pattern_matches_active(self, pattern: dict) -> bool:
-        """If active_patterns is set, only these pattern titles/slugs apply exclude effects."""
-        if self.active_patterns is None:
-            return True
-        title = pattern.get("title", "") or ""
-        slug = self._slug_pattern_title(title)
-        return title in self.active_patterns or slug in self.active_patterns
+    def _parse_active_phi_types(self, raw) -> frozenset[str] | None:
+        items = self._parse_str_list(raw, "active_phi_types")
+        if items is None:
+            return None
+        known = set(self.phi_type_list)
+        unknown = [x for x in items if x not in known]
+        if unknown and self.verbose:
+            print("Warning: unknown phi types ignored (not in phi_type_list):", unknown)
+        phi_types = frozenset(x for x in items if x in known)
+        if not phi_types:
+            raise ValueError("active_phi_types: no valid types after filtering known list")
+        return phi_types
 
-    def _exclude_effect_enabled(
-        self, phi_type: str, exclude: bool, pattern: dict
+    def _parse_active_patterns(self, raw) -> frozenset[str] | None:
+        items = self._parse_str_list(raw, "active_patterns")
+        if items is None:
+            return None
+        return frozenset(items) | frozenset(self._slug_pattern_title(x) for x in items)
+
+    def _pattern_phi_type(self, pattern: dict) -> str:
+        phi_type = pattern.get("phi_type", "OTHER")
+        return phi_type if phi_type in self.phi_type_list else "OTHER"
+
+    def _exclude_rule_enabled(
+        self,
+        pattern: dict,
+        phi_types: frozenset[str] | None,
+        patterns: frozenset[str] | None,
+        hipaa_identifiers: frozenset[int] | None,
     ) -> bool:
-        """Whitelist patterns always apply; exclude patterns may be limited by HIPAA id, pattern titles, and phi types."""
-        if not exclude:
-            return True
-        if not self._pattern_matches_hipaa(pattern):
+        """Whether an exclude rule applies under a selection; each set limits rules when it is not None."""
+        if hipaa_identifiers is not None and not (
+            hipaa_identifiers & pattern_hipaa_ids_for_pattern(pattern)
+        ):
             return False
-        if not self._pattern_matches_active(pattern):
-            return False
-        if self.active_phi_types is None:
-            return True
-        return phi_type in self.active_phi_types
+        if patterns is not None:
+            title = pattern.get("title", "") or ""
+            if title not in patterns and self._slug_pattern_title(title) not in patterns:
+                return False
+        return phi_types is None or self._pattern_phi_type(pattern) in phi_types
 
-    def map_coordinates_text(self, txt: str, filename: str | None = None, reset=True):
+    def _build_scope(
+        self,
+        phi_types: frozenset[str] | None,
+        patterns: frozenset[str] | None,
+        hipaa_identifiers: frozenset[int] | None,
+    ) -> "PhiScope":
+        disabled = {
+            i
+            for i, pattern in enumerate(self.patterns)
+            if pattern["exclude"]
+            and not self._exclude_rule_enabled(pattern, phi_types, patterns, hipaa_identifiers)
+        }
+        # A regex_context rule with a named context_filter reads that rule's matches, so the
+        # referenced rule (and whatever it reads in turn) must still run even when it is disabled.
+        needed = set()
+        pending = [i for i in range(len(self.patterns)) if i not in disabled]
+        while pending:
+            pattern = self.patterns[pending.pop()]
+            context_filter = pattern.get("context_filter", "all")
+            if pattern["type"] == "regex_context" and context_filter != "all":
+                source = self.pattern_indexes[context_filter]
+                if source in disabled and source not in needed:
+                    needed.add(source)
+                    pending.append(source)
+        return PhiScope(
+            phi_types=phi_types,
+            patterns=patterns,
+            hipaa_identifiers=hipaa_identifiers,
+            disabled=frozenset(disabled),
+            skipped=frozenset(disabled - needed),
+            owner=id(self),
+        )
+
+    def make_scope(self, config: dict) -> "PhiScope":
+        """Build a rule selection for map_coordinates_text(scope=...) from config-style keys.
+
+        Reads ``active_phi_types``, ``active_patterns`` and ``active_hipaa_identifiers`` (or
+        ``active_hipaa``), with the same meaning and validation as in the constructor config;
+        other keys are ignored. Missing or empty keys select all rules. Build a scope once and
+        reuse it: this precomputes which exclude rules are disabled.
+        """
+        raw_hipaa = config.get("active_hipaa_identifiers") or config.get("active_hipaa")
+        return self._build_scope(
+            self._parse_active_phi_types(config.get("active_phi_types")),
+            self._parse_active_patterns(config.get("active_patterns")),
+            parse_active_hipaa_identifiers(raw_hipaa),
+        )
+
+    @property
+    def default_scope(self) -> "PhiScope":
+        """Scope from the constructor config (the active_* attributes); rebuilt if they change."""
+        key = (self.active_phi_types, self.active_patterns, self.active_hipaa_identifiers)
+        if self._default_scope is None or self._default_scope_key != key:
+            self._default_scope = self._build_scope(*key)
+            self._default_scope_key = key
+        return self._default_scope
+
+    def map_coordinates_text(
+        self,
+        txt: str,
+        filename: str | None = None,
+        reset=True,
+        scope: "PhiScope | None" = None,
+    ):
+        """Find PHI in ``txt``; results go to ``self.data_all_files[filename]["phi"]``.
+
+        ``scope`` (from make_scope() on this instance) selects the exclude rules for this call
+        instead of the constructor config.
+        """
         if filename is None:
             filename = '.'
+
+        if scope is None:
+            scope = self.default_scope
+        elif scope.owner != id(self):
+            raise ValueError("scope was built by another Philter instance")
 
         if reset:
             self.reset()
@@ -510,21 +597,21 @@ class Philter:
         # Get full self.include/exclude map before transform
         self.data_all_files[filename] = {"text": txt, "phi": [], "non-phi": []}
 
-        if self.verbose and self.active_phi_types is not None:
+        if self.verbose and scope.phi_types is not None:
             print(
                 "active_phi_types (exclude rules only):",
-                ", ".join(sorted(self.active_phi_types)),
+                ", ".join(sorted(scope.phi_types)),
             )
-        if self.verbose and self.active_patterns is not None:
+        if self.verbose and scope.patterns is not None:
             print(
                 "active_patterns (exclude rules only):",
-                len(self.active_patterns),
+                len(scope.patterns),
                 "title/slug tokens",
             )
-        if self.verbose and self.active_hipaa_identifiers is not None:
+        if self.verbose and scope.hipaa_identifiers is not None:
             parts = [
                 f"{i}:{HIPAA_18[i - 1]['key']}"
-                for i in sorted(self.active_hipaa_identifiers)
+                for i in sorted(scope.hipaa_identifiers)
             ]
             print("active_hipaa_identifiers (exclude rules only):", ", ".join(parts))
 
@@ -555,6 +642,8 @@ class Philter:
             t_text0 = time.perf_counter()
 
         for i,pat in enumerate(self.patterns):
+            if i in scope.skipped:
+                continue
             if profile_rows is not None:
                 t0 = time.perf_counter()
             if pat["type"] == "regex":
@@ -573,7 +662,9 @@ class Philter:
                 raise Exception("Error, pattern type not supported: ", pat["type"])
             if profile_rows is not None:
                 t1 = time.perf_counter()
-            self.get_exclude_include_maps(filename, pat, txt)
+            self.get_exclude_include_maps(
+                filename, pat, txt, apply_exclude=i not in scope.disabled
+            )
             if profile_rows is not None:
                 t2 = time.perf_counter()
                 profile_rows.append(
@@ -1031,7 +1122,11 @@ class Philter:
             for filename in files:
                 yield root,filename
 
-    def get_exclude_include_maps(self, filename, pattern, txt):
+    def get_exclude_include_maps(self, filename, pattern, txt, apply_exclude=True):
+        """Merge one rule's matches into the include/exclude maps.
+
+        ``apply_exclude=False`` ignores the matches of an exclude rule (it is disabled by the scope).
+        """
 
         coord_map = pattern["coordinate_map"]
         exclude = pattern["exclude"]
@@ -1049,7 +1144,7 @@ class Philter:
         if phi_type not in self.phi_type_dict:
             phi_type = "OTHER"
 
-        apply_exclude_phi = self._exclude_effect_enabled(phi_type, exclude, pattern)
+        apply_exclude_phi = apply_exclude
 
         for start,stop in coord_map.filecoords(filename):
 
